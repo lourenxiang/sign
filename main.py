@@ -1,11 +1,11 @@
 import time
 import logging
 from logging.handlers import TimedRotatingFileHandler
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 
 from flask import Flask, request, jsonify
 import sign
-from menu import random_meal_selection
 
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False
@@ -69,38 +69,23 @@ def yjj():
     return response
 
 
-@app.route('/menu', methods=['GET'])
-def menu():
-    app.logger.info("menu接口被调用")
-    result = random_meal_selection()
-    response = jsonify({
-        'message': result
-    })
-    response.headers['Content-Type'] = 'application/json; charset=utf-8'
-    return response
-
 
 @app.route('/run', methods=['GET'])
 def run():
-    """
-    解析 text 参数
-    格式：user:password:transfer,user:password:transfer
-    返回：[{'user': '', 'password': '', 'transfer': ''}, ...]
-    """
-
-    text = request.args.get('text', '')
+    text = request.args.get('text', '').strip()
     name = request.args.get('name', 'unknow')
     app.logger.info(f"{name}---run接口被调用，text参数：{text}")
 
     if not text:
-        app.logger.warning(f"{name}---text参数为空")
         return jsonify({
             'code': 400,
             'message': '参数 text 不能为空',
             'data': None
         }), 400
 
-    items = text.split(',')
+    items = [item.strip() for item in text.split(',') if item.strip()]
+    total = len(items)
+
     result = {
         '成功': [],
         '失败': []
@@ -108,63 +93,70 @@ def run():
     success_count = 0
     fail_count = 0
 
-    app.logger.info(f"{name}---开始处理 {len(items)} 个账号")
+    app.logger.info(f"{name}---开始并发处理 {total} 个账号（每次最多5个）")
 
-    for idx, item in enumerate(items, 1):
-        item = item.strip()  # 去除空格
-        if not item:
-            continue
+    # -----------------------------
+    # 线程池（5个并发）
+    # -----------------------------
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_map = {}
 
-        # 再按 : 分割用户信息
-        parts = item.split(':')
-        if len(parts) == 3:
+        # 提交任务
+        for idx, item in enumerate(items, 1):
+            parts = item.split(':')
+
+            if len(parts) != 3:
+                user = parts[0].strip() if parts else "未知"
+                result['失败'].append(f"{user}: 格式错误，应为 user:password:transfer")
+                app.logger.error(f"{name}---格式不正确：{item}")
+                fail_count += 1
+                continue
+
             user = parts[0].strip()
             password = parts[1].strip()
             transfer = parts[2].strip()
 
-            app.logger.info(f"{name}---处理第 {idx} 个账号：{user}")
+            # 把每个执行任务提交给线程池
+            future = executor.submit(sign.sign_and_transfer, name, user, password, transfer)
+            future_map[future] = user
 
+            app.logger.info(f"{name}---已提交账号 {user}")
+
+        # 收集线程执行结果
+        for future in as_completed(future_map):
+            user = future_map[future]
             try:
-                res, log = sign.sign_and_transfer(name, user, password, transfer)
+                res, log = future.result()
 
                 if res:
-                    result['成功'].append(
-                        parts[0].strip() + ': ' + log
-                    )
+                    result['成功'].append(f"{user}: {log}")
                     success_count += 1
                     app.logger.info(f"{name}---账号 {user} 处理成功")
                 else:
-                    result['失败'].append(
-                        parts[0].strip() + ': ' + log
-                    )
+                    result['失败'].append(f"{user}: {log}")
                     fail_count += 1
                     app.logger.warning(f"{name}---账号 {user} 处理失败")
+
             except Exception as e:
-                app.logger.error(f"{name}---账号 {user} 处理异常：{str(e)}", exc_info=True)
-                result['失败'].append(
-                    parts[0].strip() + ': 处理异常 - ' + str(e)
-                )
+                msg = f"{user}: 处理异常 - {str(e)}"
+                result['失败'].append(msg)
                 fail_count += 1
-        else:
-            # 格式不正确
-            app.logger.error(f"{name}---格式不正确：{item}")
-            result['失败'].append({
-                parts[0].strip() if parts else '未知': '格式错误，应为 user:password:transfer'
-            })
-            fail_count += 1
+                app.logger.error(f"{name}---账号 {user} 处理异常：{str(e)}", exc_info=True)
 
-        time.sleep(0.05)
-
-    app.logger.info(f"{name}---所有账号处理完成 - 总数：{len(items)}，成功：{success_count}，失败：{fail_count}")
+    # -----------------------------
+    # 处理完成
+    # -----------------------------
+    app.logger.info(
+        f"{name}---所有账号处理完成 - 总数：{total}，成功：{success_count}，失败：{fail_count}"
+    )
 
     response = jsonify({
-        '总数': len(items),
+        '总数': total,
         '成功': success_count,
         '失败': fail_count,
         'users': result
     })
     response.headers['Content-Type'] = 'application/json; charset=utf-8'
-
     return response, 200
 
 
