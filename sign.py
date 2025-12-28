@@ -1,12 +1,13 @@
 import requests
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 
 
-def sign_and_transfer(name : str, username: str, password: str, receiver_uid: str, application_type="gzh"):
+def sign_and_transfer(name: str, username: str, password: str, receiver_uid: str, application_type="gzh"):
     """
-    登录 → 签到 → 查询账户 → 划转消费券到指定账户
+    登录 → 签到 → 查询账户 → （新增）校验支付密码 → 划转消费券到指定账户
     """
     log = ''
     prefix = f"[{username}]"
@@ -135,15 +136,15 @@ def sign_and_transfer(name : str, username: str, password: str, receiver_uid: st
             log += res
             return False, log
 
+        # ---------- 4. 无需划转 ----------
         if receiver_uid == 'x':
             res = "；无需划转"
             log += res
             logger.warning(f"{name}---{prefix} ⊘ {res}")
             return True, log
 
-        # ---------- 4. 查询账户 ----------
+        # ---------- 5. 查询余额 ----------
         logger.info(f"{name}---{prefix} [进行中] 正在查询账户消费券余额...")
-        ACCOUNT_URL = f"https://h5-shop-api.yiyiton.com/member/getAccount?applicationType={application_type}"
 
         try:
             account_resp = requests.get(ACCOUNT_URL, headers=auth_headers, timeout=10)
@@ -179,12 +180,64 @@ def sign_and_transfer(name : str, username: str, password: str, receiver_uid: st
             return False, log
         logger.info(f"{name}---{prefix} ✓ 查询成功，消费券余额：{consumption_coupon}")
 
-        # ---------- 5. 划转消费券 ----------
+        # ===================================================================
+        # ===================== 新增步骤：校验支付密码 ======================
+        # ===================================================================
+        # !!! 新接口要求 JSON，所以覆盖 content-type
+        auth_headers["Content-Type"] = "application/json"
+        logger.info(f"{name}---{prefix} [进行中] 正在校验支付密码...")
+        CHECK_PAY_URL = "https://h5-shop-api.yiyiton.com/member/checkPayPassword"
+        
+        if name == 'lrx' or name == 'fsj':
+            pay_check_body = {"payPassword": password}
+        elif name == 'clc':
+            pay_check_body = {"payPassword": '334491'}
+        else:
+            pay_check_body = {"payPassword": '123456'}
+        
+        try:
+            check_resp = requests.post(CHECK_PAY_URL, headers=auth_headers,
+                                       data=json.dumps(pay_check_body), timeout=10)
+            check_resp.raise_for_status()
+            check_result = check_resp.json()
+        except requests.exceptions.Timeout:
+            res = "；校验支付密码请求超时"
+            logger.error(f"{name}---{prefix} ✗ {res}")
+            log += res
+            return False, log
+        except requests.exceptions.RequestException as e:
+            res = f"；校验支付密码网络异常：{str(e)}"
+            logger.error(f"{name}---{prefix} ✗ {res}")
+            log += res
+            return False, log
+        except ValueError as e:
+            res = f"；校验支付密码响应JSON解析失败：{str(e)}"
+            logger.error(f"{name}---{prefix} ✗ {res}，响应体：{check_resp.text}")
+            log += res
+            return False, log
+
+        if check_result.get("code") != 200:
+            res = f"；支付密码校验失败，响应码：{check_result.get('code')}，消息：{check_result.get('message', '未知错误')}"
+            logger.error(f"{name}---{prefix} ✗ {res}，完整响应体：{check_result}")
+            log += res
+            return False, log
+
+        pay_code = check_result["data"]
+        logger.info(f"{name}---{prefix} ✓ 支付密码校验成功，payCode={pay_code}")
+
+        # ===================================================================
+        # ===================== 6. 划转消费券（带 password + payCode） ======
+        # ===================================================================
+        # !!! 新接口要求 x-www-form-urlencoded，所以覆盖 content-type
+        auth_headers["Content-Type"] = "application/x-www-form-urlencoded"
         logger.info(f"{name}---{prefix} [进行中] 正在划转消费券到账户 {receiver_uid}...")
         TRANSFER_URL = "https://h5-shop-api.yiyiton.com/member/consumption/coupon/transfer/to/user"
+
         transfer_data = {
             "amount": consumption_coupon,
             "receiverUid": receiver_uid,
+            "password": password,
+            "payCode": pay_code,
             "applicationType": application_type
         }
 
